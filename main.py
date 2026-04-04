@@ -24,16 +24,22 @@ from aiohttp import web
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")
+OWNER_ID_STR = os.getenv("OWNER_ID")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8443))
 
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения!")
+    raise ValueError("❌ BOT_TOKEN не найден!")
+if not WEBHOOK_URL:
+    raise ValueError("❌ WEBHOOK_URL не задан в Environment Variables!")
+
+# Безопасное преобразование OWNER_ID
+OWNER_ID = int(OWNER_ID_STR) if OWNER_ID_STR and OWNER_ID_STR.isdigit() else None
 
 kiev = pytz.timezone("Europe/Kiev")
 START_DATE = datetime(2025, 1, 1).date()
 
-# Хранилища состояний
+# Состояния пользователей
 user_guessing: Dict[int, bool] = {}
 last_request: Dict[int, float] = {}
 
@@ -51,10 +57,6 @@ def is_spam(user_id: int, cooldown: float = 2.0) -> bool:
         return True
     last_request[user_id] = now
     return False
-
-
-def is_leap_year(year: int) -> bool:
-    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
 
 
 def get_custom_time() -> str:
@@ -83,8 +85,7 @@ def build_10month_calendar() -> str:
     for i, days in enumerate(month_lengths):
         cal += f"Месяц {i+1:02d}:\n"
         for d in range(1, days + 1):
-            marker = f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
-            cal += marker
+            cal += f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
             if d % 10 == 0:
                 cal += "\n"
         cal += "\n"
@@ -95,7 +96,7 @@ def get_13month_date():
     delta = (datetime.now().date() - START_DATE).days
     year = 25 + delta // 365
     day_of_year = delta % 365
-    is_leap = is_leap_year(2000 + year)
+    is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
     months = [28] * 12 + [29 + int(is_leap)]
     month = 0
     while month < 13 and day_of_year >= months[month]:
@@ -106,38 +107,37 @@ def get_13month_date():
 
 def build_13month_calendar() -> str:
     year, cur_month, cur_day = get_13month_date()
-    is_leap = is_leap_year(2000 + year)
+    is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
     months = [28] * 12 + [29 + int(is_leap)]
     cal = f"📅 Альтернативный календарь (13 месяцев)\nГод: {year}\n\n"
     for i, days in enumerate(months):
         cal += f"Месяц {i+1:02d}:\n"
         for d in range(1, days + 1):
-            marker = f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
-            cal += marker
+            cal += f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
             if d % 7 == 0:
                 cal += "\n"
         cal += "\n"
     return cal
 
 
-# ====================== NOTIFY OWNER ======================
+# ====================== NOTIFY ======================
 async def notify_owner(bot, user, action: str):
-    if OWNER_ID:
+    if OWNER_ID and user.id != OWNER_ID:   # Защита от самофлуда
         try:
             text = f"👤 @{user.username or user.first_name} (ID: {user.id})\n{action}"
             await bot.send_message(chat_id=OWNER_ID, text=text)
         except Exception as e:
-            logger.error(f"Notify owner failed: {e}")
+            logger.error(f"Notify failed: {e}")
 
 
 # ====================== HANDLERS ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_spam(update.effective_user.id):
+        await update.message.reply_text("⏳ Подожди пару секунд...")
         return
 
     year, month, day = get_10month_date()
     text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y:%d:%m   %H:%M:%S')}"
-    
     await update.message.reply_text(text)
     await notify_owner(context.bot, update.effective_user, "Запустил бота (/start)")
 
@@ -173,7 +173,7 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def joking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_guessing.get(user_id):
-        await update.message.reply_text("🎲 Вы уже в игре! Введите два числа от 1 до 6.")
+        await update.message.reply_text("🎲 Вы уже в игре!")
         return
     user_guessing[user_id] = True
     await update.message.reply_text("🎲 Введите два числа от 1 до 6 через пробел:")
@@ -202,6 +202,10 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Не угадали. Выпало: {d1} и {d2}")
 
 
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❓ Неизвестная команда.\nНапиши /me — чтобы увидеть список команд.")
+
+
 # ====================== AUTO SEND ======================
 async def periodic_send(application: Application):
     if not OWNER_ID:
@@ -210,9 +214,8 @@ async def periodic_send(application: Application):
         year, month, day = get_10month_date()
         text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y.%d.%m   %H:%M:%S')}"
         await application.bot.send_message(chat_id=OWNER_ID, text=text)
-        logger.info("✅ Автосообщение отправлено владельцу")
     except Exception as e:
-        logger.error(f"Ошибка автосообщения: {e}")
+        logger.error(f"Auto send error: {e}")
 
 
 # ====================== MAIN ======================
@@ -227,6 +230,7 @@ async def main():
     application.add_handler(CommandHandler("me", me))
     application.add_handler(CommandHandler("joking", joking))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     # Scheduler
     scheduler = AsyncIOScheduler()
@@ -236,10 +240,9 @@ async def main():
     await application.initialize()
     await application.start()
 
-    # Автоустановка webhook
-    webhook_url = f"https://lkklnd-bot.onrender.com/{BOT_TOKEN}"
-    await application.bot.set_webhook(webhook_url)
-    logger.info(f"✅ Webhook установлен: {webhook_url}")
+    # Установка webhook
+    await application.bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"✅ Webhook успешно установлен → {WEBHOOK_URL}")
 
     # aiohttp server
     app = web.Application()
@@ -255,7 +258,8 @@ async def main():
             logger.error(f"Webhook error: {e}")
             return web.Response(status=500)
 
-    app.router.add_post(f"/{BOT_TOKEN}", webhook_handler)
+    app.router.add_post("/webhook", webhook_handler)        # ← Более безопасный путь
+    app.router.add_get("/", lambda r: web.Response(text="Bot is running"))
     app.router.add_get("/health", lambda r: web.Response(text="OK"))
 
     runner = web.AppRunner(app)
@@ -268,8 +272,7 @@ async def main():
     try:
         await asyncio.Event().wait()
     finally:
-        # Graceful Shutdown
-        logger.info("🛑 Остановка бота...")
+        logger.info("🛑 Graceful shutdown...")
         scheduler.shutdown()
         await application.stop()
         await application.shutdown()
