@@ -1,242 +1,279 @@
-import logging
 import os
+import logging
 import asyncio
+import random
 import time
-from typing import Dict, Tuple
+from datetime import datetime
+from typing import Dict
 
-from fastapi import FastAPI, Request
-from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
+import pytz
+from dotenv import load_dotenv
+
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
-from geopy.geocoders import Nominatim
-from dotenv import load_dotenv
-from httpx import AsyncClient, Timeout, RequestError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 # ====================== CONFIG ======================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", 0))
-OPENWEATHER_TOKEN = os.getenv("OPENWEATHER_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+OWNER_ID = os.getenv("OWNER_ID")
+PORT = int(os.getenv("PORT", 8443))
 
-assert BOT_TOKEN, "❌ BOT_TOKEN не установлен!"
-assert OPENWEATHER_TOKEN, "❌ OPENWEATHER_TOKEN не установлен!"
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения!")
 
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+kiev = pytz.timezone("Europe/Kiev")
+START_DATE = datetime(2025, 1, 1).date()
+
+# Хранилища состояний
+user_guessing: Dict[int, bool] = {}
+last_request: Dict[int, float] = {}
 
 # ====================== LOGGING ======================
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ====================== APP ======================
-app = FastAPI(title="Weather Bot ULTRA")
-bot = Bot(token=BOT_TOKEN)
-bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-# ====================== SERVICES ======================
-geolocator = Nominatim(user_agent="weather-bot")
-http_client = AsyncClient(timeout=Timeout(10.0))
-
-user_locations: Dict[int, Tuple[float, float]] = {}
-last_request: Dict[int, float] = {}   # Анти-спам
-
-
-def is_spam(user_id: int) -> bool:
-    """Простая защита от спама (2 секунды между запросами)"""
+# ====================== HELPERS ======================
+def is_spam(user_id: int, cooldown: float = 2.0) -> bool:
     now = time.time()
-    if user_id in last_request and now - last_request[user_id] < 2:
+    if user_id in last_request and now - last_request[user_id] < cooldown:
         return True
     last_request[user_id] = now
     return False
 
 
-async def safe_request(url: str, params: dict, retries: int = 3):
-    """Улучшенный запрос с умным retry"""
-    for attempt in range(retries):
+def is_leap_year(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def get_custom_time() -> str:
+    t = time.localtime()
+    total_min = t.tm_hour * 60 + t.tm_min
+    return f"{t.tm_sec:02d}:{total_min // 40:02d}:{total_min % 40:02d}"
+
+
+# ====================== КАЛЕНДАРИ ======================
+def get_10month_date():
+    delta = (datetime.now().date() - START_DATE).days
+    year = 25 + delta // 365
+    day_of_year = delta % 365
+    month_lengths = [37 if i % 2 == 0 else 36 for i in range(10)]
+    month = 0
+    while month < 10 and day_of_year >= month_lengths[month]:
+        day_of_year -= month_lengths[month]
+        month += 1
+    return year, month + 1, day_of_year + 1
+
+
+def build_10month_calendar() -> str:
+    year, cur_month, cur_day = get_10month_date()
+    month_lengths = [37 if i % 2 == 0 else 36 for i in range(10)]
+    cal = f"📅 Персональный календарь (10 месяцев)\nГод: {year}\n\n"
+    for i, days in enumerate(month_lengths):
+        cal += f"Месяц {i+1:02d}:\n"
+        for d in range(1, days + 1):
+            marker = f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
+            cal += marker
+            if d % 10 == 0:
+                cal += "\n"
+        cal += "\n"
+    return cal
+
+
+def get_13month_date():
+    delta = (datetime.now().date() - START_DATE).days
+    year = 25 + delta // 365
+    day_of_year = delta % 365
+    is_leap = is_leap_year(2000 + year)
+    months = [28] * 12 + [29 + int(is_leap)]
+    month = 0
+    while month < 13 and day_of_year >= months[month]:
+        day_of_year -= months[month]
+        month += 1
+    return year, month + 1, day_of_year + 1
+
+
+def build_13month_calendar() -> str:
+    year, cur_month, cur_day = get_13month_date()
+    is_leap = is_leap_year(2000 + year)
+    months = [28] * 12 + [29 + int(is_leap)]
+    cal = f"📅 Альтернативный календарь (13 месяцев)\nГод: {year}\n\n"
+    for i, days in enumerate(months):
+        cal += f"Месяц {i+1:02d}:\n"
+        for d in range(1, days + 1):
+            marker = f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
+            cal += marker
+            if d % 7 == 0:
+                cal += "\n"
+        cal += "\n"
+    return cal
+
+
+# ====================== NOTIFY OWNER ======================
+async def notify_owner(bot, user, action: str):
+    if OWNER_ID:
         try:
-            response = await http_client.get(url, params=params)
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:          # Rate limit
-                await asyncio.sleep(2)
-            elif response.status_code >= 500:          # Серверные ошибки
-                await asyncio.sleep(1 * (attempt + 1))
-            else:
-                logger.warning(f"HTTP {response.status_code}")
-                break
-                
-        except RequestError as e:
-            logger.warning(f"Request error (attempt {attempt+1}): {e}")
-            await asyncio.sleep(1 * (attempt + 1))
-    return None
-
-
-# ====================== CORE FUNCTIONS ======================
-def get_address(lat: float, lon: float) -> str:
-    try:
-        location = geolocator.reverse((lat, lon), language="ru")
-        return location.address if location else "Адрес не найден"
-    except Exception as e:
-        logger.error(f"Geocode error: {e}")
-        return "Ошибка определения адреса"
-
-
-async def get_weather(lat: float, lon: float) -> str:
-    data = await safe_request(
-        "https://api.openweathermap.org/data/2.5/weather",
-        {"lat": lat, "lon": lon, "appid": OPENWEATHER_TOKEN, "units": "metric", "lang": "ru"},
-    )
-    if not data or "main" not in data:
-        return "❌ Не удалось получить погоду"
-    return (
-        f"🌤 {data['weather'][0]['description'].capitalize()}\n"
-        f"🌡 {data['main']['temp']}°C (ощущается {data['main']['feels_like']}°C)\n"
-        f"💧 Влажность: {data['main']['humidity']}%\n"
-        f"💨 Ветер: {data['wind']['speed']} м/с"
-    )
-
-
-async def get_forecast(lat: float, lon: float) -> str:
-    data = await safe_request(
-        "https://api.openweathermap.org/data/2.5/forecast",
-        {"lat": lat, "lon": lon, "appid": OPENWEATHER_TOKEN, "units": "metric", "lang": "ru"},
-    )
-    if not data or "list" not in data:
-        return "❌ Не удалось получить прогноз"
-    lines = ["📅 Прогноз на ближайшие часы:"]
-    for item in data["list"][:7]:
-        lines.append(
-            f"🕓 {item['dt_txt']} — {item['weather'][0]['description'].capitalize()}, "
-            f"🌡 {item['main']['temp']}°C, 💨 {item['wind']['speed']} м/с"
-        )
-    return "\n".join(lines)
+            text = f"👤 @{user.username or user.first_name} (ID: {user.id})\n{action}"
+            await bot.send_message(chat_id=OWNER_ID, text=text)
+        except Exception as e:
+            logger.error(f"Notify owner failed: {e}")
 
 
 # ====================== HANDLERS ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[KeyboardButton("📍 Отправить геолокацию", request_location=True)]]
-    await update.message.reply_text(
-        "Нажми кнопку и получи погоду 👇",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-    )
-    if OWNER_ID:
-        user = update.message.from_user
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"👤 @{user.username or user.first_name} (ID: {user.id}) запустил бота",
-        )
-
-
-async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Анти-спам временно убран для теста
-    try:
-        user = update.message.from_user
-        loc = update.message.location
-        lat, lon = loc.latitude, loc.longitude
-
-        user_locations[user.id] = (lat, lon)
-
-        # Параллельные запросы к geolocator и API
-        loop = asyncio.get_running_loop()
-        address_task = loop.run_in_executor(None, get_address, lat, lon)
-        
-        weather, forecast, address = await asyncio.gather(
-            get_weather(lat, lon),
-            get_forecast(lat, lon),
-            address_task
-        )
-
-        map_url = f"https://static-maps.yandex.ru/1.x/?ll={lon},{lat}&size=450,300&z=14&l=map&pt={lon},{lat},pm2rdm"
-        
-        caption = (
-            f"📍 {address}\n"
-            f"{'─'*25}\n\n"
-            f"{weather}\n\n"
-            f"{'─'*25}\n"
-            f"{forecast}"
-        )
-
-        await update.message.reply_photo(photo=map_url, caption=caption)
-
-        if OWNER_ID:
-            await context.bot.send_photo(
-                chat_id=OWNER_ID,
-                photo=map_url,
-                caption=f"👤 @{user.username or user.first_name}\n📍 {address}\n\n{weather}\n\n{forecast}",
-            )
-
-    except Exception as e:
-        logger.error(f"handle_location error: {e}")
-        await update.message.reply_text("Ошибка при обработке локации")
-
-async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id not in user_locations:
-        await update.message.reply_text("Сначала отправь геолокацию")
+    if is_spam(update.effective_user.id):
         return
-    lat, lon = user_locations[user_id]
-    forecast_text = await get_forecast(lat, lon)
-    await update.message.reply_text(forecast_text)
+
+    year, month, day = get_10month_date()
+    text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y:%d:%m   %H:%M:%S')}"
+    
+    await update.message.reply_text(text)
+    await notify_owner(context.bot, update.effective_user, "Запустил бота (/start)")
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Global error: {context.error}")
+async def full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_10month_calendar())
+    await notify_owner(context.bot, update.effective_user, "Открыл календарь 10 месяцев (/full)")
 
 
-# ====================== BOT SETUP ======================
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(CommandHandler("forecast", forecast_cmd))
-bot_app.add_handler(MessageHandler(filters.LOCATION, handle_location))
-bot_app.add_error_handler(error_handler)
+async def open_alt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    year, month, day = get_13month_date()
+    text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y:%d:%m   %H:%M:%S')}"
+    await update.message.reply_text(text)
+    await notify_owner(context.bot, update.effective_user, "Открыл дату 13 месяцев (/open)")
 
 
-# ====================== FASTAPI ======================
-@app.get("/")
-async def health():
-    return {"status": "ok"}
+async def all_alt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_13month_calendar())
+    await notify_owner(context.bot, update.effective_user, "Открыл календарь 13 месяцев (/all)")
 
 
-@app.post(WEBHOOK_PATH)
-async def webhook(req: Request):
-    data = await req.json()
-
-    # 🔹 Логируем весь апдейт для отладки
-    print("===== NEW UPDATE =====")
-    print(data)
-
-    update = Update.de_json(data, bot_app.bot)
-    await bot_app.process_update(update)
-    return {"ok": True}
+async def me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start — текущая дата\n"
+        "/full — календарь 10 месяцев\n"
+        "/open — дата 13 месяцев\n"
+        "/all — календарь 13 месяцев\n"
+        "/joking — игра с кубиками\n"
+        "/me — это меню"
+    )
 
 
-@app.on_event("startup")
-async def startup():
-    await bot_app.initialize()
-    await bot_app.start()
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"✅ Webhook успешно установлен: {WEBHOOK_URL}")
+async def joking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_guessing.get(user_id):
+        await update.message.reply_text("🎲 Вы уже в игре! Введите два числа от 1 до 6.")
+        return
+    user_guessing[user_id] = True
+    await update.message.reply_text("🎲 Введите два числа от 1 до 6 через пробел:")
+
+
+async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not user_guessing.get(user_id):
+        return
+
+    try:
+        g1, g2 = map(int, update.message.text.strip().split())
+        if not (1 <= g1 <= 6 and 1 <= g2 <= 6):
+            raise ValueError
+    except:
+        await update.message.reply_text("⚠️ Введите два числа от 1 до 6 через пробел.")
+        return
+
+    d1 = random.randint(1, 6)
+    d2 = random.randint(1, 6)
+
+    if (g1, g2) == (d1, d2) or (g1, g2) == (d2, g1):
+        await update.message.reply_text(f"🎉 Угадали! Выпало: {d1} и {d2}")
+        user_guessing[user_id] = False
     else:
-        logger.error("❌ WEBHOOK_URL не задан в переменных окружения!")
+        await update.message.reply_text(f"❌ Не угадали. Выпало: {d1} и {d2}")
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    await http_client.aclose()
-    await bot_app.stop()
-    await bot_app.shutdown()
+# ====================== AUTO SEND ======================
+async def periodic_send(application: Application):
+    if not OWNER_ID:
+        return
+    try:
+        year, month, day = get_10month_date()
+        text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y.%d.%m   %H:%M:%S')}"
+        await application.bot.send_message(chat_id=OWNER_ID, text=text)
+        logger.info("✅ Автосообщение отправлено владельцу")
+    except Exception as e:
+        logger.error(f"Ошибка автосообщения: {e}")
+
+
+# ====================== MAIN ======================
+async def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("full", full))
+    application.add_handler(CommandHandler("open", open_alt))
+    application.add_handler(CommandHandler("all", all_alt))
+    application.add_handler(CommandHandler("me", me))
+    application.add_handler(CommandHandler("joking", joking))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess))
+
+    # Scheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(periodic_send, 'interval', minutes=1, args=[application])
+    scheduler.start()
+
+    await application.initialize()
+    await application.start()
+
+    # Автоустановка webhook
+    webhook_url = f"https://lkklnd-bot.onrender.com/{BOT_TOKEN}"
+    await application.bot.set_webhook(webhook_url)
+    logger.info(f"✅ Webhook установлен: {webhook_url}")
+
+    # aiohttp server
+    app = web.Application()
+    app["application"] = application
+
+    async def webhook_handler(request):
+        try:
+            data = await request.json()
+            update = Update.de_json(data, application.bot)
+            await application.process_update(update)
+            return web.Response(text="ok")
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return web.Response(status=500)
+
+    app.router.add_post(f"/{BOT_TOKEN}", webhook_handler)
+    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
+    logger.info(f"🚀 Бот успешно запущен на порту {PORT}")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # Graceful Shutdown
+        logger.info("🛑 Остановка бота...")
+        scheduler.shutdown()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    asyncio.run(main())
