@@ -26,27 +26,34 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID_STR = os.getenv("OWNER_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", 8443))
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не найден!")
 if not WEBHOOK_URL:
-    raise ValueError("❌ WEBHOOK_URL не задан в Environment Variables!")
+    raise ValueError("❌ WEBHOOK_URL не задан!")
+if not WEBHOOK_SECRET:
+    raise ValueError("❌ WEBHOOK_SECRET не задан! Добавь в Environment Variables.")
 
-# Безопасное преобразование OWNER_ID
 OWNER_ID = int(OWNER_ID_STR) if OWNER_ID_STR and OWNER_ID_STR.isdigit() else None
 
 kiev = pytz.timezone("Europe/Kiev")
 START_DATE = datetime(2025, 1, 1).date()
 
-# Состояния пользователей
+# Состояния
 user_guessing: Dict[int, bool] = {}
 last_request: Dict[int, float] = {}
+ip_requests: Dict[str, list] = {}
 
 # ====================== LOGGING ======================
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -59,10 +66,32 @@ def is_spam(user_id: int, cooldown: float = 2.0) -> bool:
     return False
 
 
+def is_ddos(ip: str, limit: int = 30, window: int = 10) -> bool:
+    now = time.time()
+    if ip not in ip_requests:
+        ip_requests[ip] = []
+    ip_requests[ip] = [t for t in ip_requests[ip] if now - t < window]
+    ip_requests[ip].append(now)
+    if len(ip_requests) > 1000:
+        ip_requests.clear()
+    return len(ip_requests[ip]) > limit
+
+
 def get_custom_time() -> str:
     t = time.localtime()
     total_min = t.tm_hour * 60 + t.tm_min
     return f"{t.tm_sec:02d}:{total_min // 40:02d}:{total_min % 40:02d}"
+
+
+async def safe_send(bot, chat_id, text: str, retries: int = 3):
+    for i in range(retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.warning(f"Send retry {i+1}/{retries}: {e}")
+            await asyncio.sleep(1)
+    logger.error(f"❌ Failed to send message to {chat_id}")
+    return None
 
 
 # ====================== КАЛЕНДАРИ ======================
@@ -86,8 +115,7 @@ def build_10month_calendar() -> str:
         cal += f"Месяц {i+1:02d}:\n"
         for d in range(1, days + 1):
             cal += f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
-            if d % 10 == 0:
-                cal += "\n"
+            if d % 10 == 0: cal += "\n"
         cal += "\n"
     return cal
 
@@ -114,20 +142,15 @@ def build_13month_calendar() -> str:
         cal += f"Месяц {i+1:02d}:\n"
         for d in range(1, days + 1):
             cal += f"[{d:02d}] " if (d == cur_day and i + 1 == cur_month) else f" {d:02d} "
-            if d % 7 == 0:
-                cal += "\n"
+            if d % 7 == 0: cal += "\n"
         cal += "\n"
     return cal
 
 
 # ====================== NOTIFY ======================
 async def notify_owner(bot, user, action: str):
-    if OWNER_ID and user.id != OWNER_ID:   # Защита от самофлуда
-        try:
-            text = f"👤 @{user.username or user.first_name} (ID: {user.id})\n{action}"
-            await bot.send_message(chat_id=OWNER_ID, text=text)
-        except Exception as e:
-            logger.error(f"Notify failed: {e}")
+    if OWNER_ID and user.id != OWNER_ID:
+        await safe_send(bot, OWNER_ID, f"👤 @{user.username or user.first_name} (ID: {user.id})\n{action}")
 
 
 # ====================== HANDLERS ======================
@@ -203,19 +226,16 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Неизвестная команда.\nНапиши /me — чтобы увидеть список команд.")
+    await update.message.reply_text("❓ Неизвестная команда. Напиши /me")
 
 
 # ====================== AUTO SEND ======================
 async def periodic_send(application: Application):
     if not OWNER_ID:
         return
-    try:
-        year, month, day = get_10month_date()
-        text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y.%d.%m   %H:%M:%S')}"
-        await application.bot.send_message(chat_id=OWNER_ID, text=text)
-    except Exception as e:
-        logger.error(f"Auto send error: {e}")
+    year, month, day = get_10month_date()
+    text = f"{year:02d}:{day:02d}:{month:02d}\n{get_custom_time()}\n{datetime.now(kiev).strftime('%y.%d.%m   %H:%M:%S')}"
+    await safe_send(application.bot, OWNER_ID, text)
 
 
 # ====================== MAIN ======================
@@ -232,7 +252,6 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(periodic_send, 'interval', minutes=1, args=[application])
     scheduler.start()
@@ -240,15 +259,27 @@ async def main():
     await application.initialize()
     await application.start()
 
-    # Установка webhook
-    await application.bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"✅ Webhook успешно установлен → {WEBHOOK_URL}")
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET
+    )
+    logger.info(f"✅ Protected webhook set: {WEBHOOK_URL}")
 
-    # aiohttp server
+    # aiohttp
     app = web.Application()
     app["application"] = application
 
     async def webhook_handler(request):
+        # Secret Token protection
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            logger.warning("❌ Unauthorized webhook attempt")
+            return web.Response(status=403)
+
+        # Anti-DDoS
+        if is_ddos(request.remote):
+            logger.warning(f"⚠️ DDoS attempt from {request.remote}")
+            return web.Response(status=429)
+
         try:
             data = await request.json()
             update = Update.de_json(data, application.bot)
@@ -258,7 +289,7 @@ async def main():
             logger.error(f"Webhook error: {e}")
             return web.Response(status=500)
 
-    app.router.add_post("/webhook", webhook_handler)        # ← Более безопасный путь
+    app.router.add_post("/webhook", webhook_handler)
     app.router.add_get("/", lambda r: web.Response(text="Bot is running"))
     app.router.add_get("/health", lambda r: web.Response(text="OK"))
 
@@ -267,12 +298,12 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
 
-    logger.info(f"🚀 Бот успешно запущен на порту {PORT}")
+    logger.info(f"🚀 ULTRA Bot started on port {PORT}")
 
     try:
         await asyncio.Event().wait()
     finally:
-        logger.info("🛑 Graceful shutdown...")
+        logger.info("🛑 Shutting down...")
         scheduler.shutdown()
         await application.stop()
         await application.shutdown()
