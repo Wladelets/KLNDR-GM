@@ -1,0 +1,20 @@
+python-telegram-bot==20.8
+python-telegram-bot>=20.8
+aiohttp==3.10.10
+APScheduler==3.10.4
+python-dotenv==1.0.1
+pytz==2024.2
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+uvicorn==0.30.6
+
+python-dotenv>=1.0.0
+httpx>=0.27.0
+httpx==0.27.2
+geopy==2.4.1
+geopy>=2.4.0
+
+# Рекомендуемые (для стабильности)
+aiofiles==24.1.0
+uvicorn==0.30.6   # на случай, если позже перейдёшь на FastAPI
