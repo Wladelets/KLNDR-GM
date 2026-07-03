@@ -16,8 +16,5 @@ services:
       - key: OWNER_ID
         sync: false
       
-      - key: WEBHOOK_URL
-        value: "https://weather-bot-final.onrender.com/webhook/<SHOULD BE BOT!токен_бота>"
-        sync: false
-
+    
    
